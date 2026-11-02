@@ -112,7 +112,10 @@ export const BatchSendModal: React.FC<BatchSendModalProps> = ({
     try {
       await fetch('/api/send-applications', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
         body: JSON.stringify({
           applications: selectedInternships.map(i => {
             const { subject, body } = getPitchForInternship(i);

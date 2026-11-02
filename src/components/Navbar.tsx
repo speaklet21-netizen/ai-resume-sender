@@ -9,7 +9,8 @@ import {
   User,
   LogOut,
   LogIn,
-  KeyRound
+  KeyRound,
+  X
 } from 'lucide-react';
 import { UserAccount } from '../types.ts';
 
@@ -22,6 +23,9 @@ interface NavbarProps {
   currentUser: UserAccount | null;
   onOpenAuth: () => void;
   onLogout: () => void;
+  onConnectGmail?: () => void;
+  onDisconnectGmail?: () => void;
+  isConnectingGmail?: boolean;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -33,6 +37,9 @@ export const Navbar: React.FC<NavbarProps> = ({
   currentUser,
   onOpenAuth,
   onLogout,
+  onConnectGmail,
+  onDisconnectGmail,
+  isConnectingGmail = false,
 }) => {
   return (
     <header className="sticky top-0 z-40 bg-[#1c1c1e] text-white border-b border-slate-800 shadow-xl">
@@ -121,9 +128,43 @@ export const Navbar: React.FC<NavbarProps> = ({
           </nav>
 
           {/* Right side: User Profile / Auth State */}
-          <div className="flex items-center gap-2.5 sm:gap-3">
+          <div className="flex items-center gap-2 sm:gap-3">
             {currentUser ? (
-              <div className="flex items-center gap-2 bg-slate-900/90 border border-slate-700/80 rounded-2xl p-1.5 pl-3">
+              <>
+                {/* Gmail Connection Status Pill */}
+                {currentUser.gmailStatus?.connected ? (
+                  <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 text-xs font-bold shadow-xs">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+                    <span className="hidden lg:inline truncate max-w-[150px]" title={currentUser.gmailStatus.connectedEmail}>
+                      {currentUser.gmailStatus.connectedEmail}
+                    </span>
+                    <span className="lg:hidden">Gmail Connected</span>
+                    {onDisconnectGmail && (
+                      <button
+                        type="button"
+                        onClick={onDisconnectGmail}
+                        title="Disconnect Gmail Account"
+                        className="ml-1 p-0.5 rounded-md text-emerald-400 hover:text-rose-400 hover:bg-emerald-900/40 transition-colors"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  onConnectGmail && (
+                    <button
+                      type="button"
+                      onClick={onConnectGmail}
+                      disabled={isConnectingGmail}
+                      className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white font-extrabold text-xs shadow-md shadow-violet-600/20 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    >
+                      <Mail className="w-3.5 h-3.5 text-violet-200" />
+                      <span>{isConnectingGmail ? 'Connecting...' : 'Connect Gmail'}</span>
+                    </button>
+                  )
+                )}
+
+                <div className="flex items-center gap-2 bg-slate-900/90 border border-slate-700/80 rounded-2xl p-1.5 pl-3">
                 <div className="flex items-center gap-2">
                   <div className="w-7 h-7 rounded-xl bg-[#d9f99d] text-slate-950 font-black text-xs flex items-center justify-center shadow-xs">
                     {(currentUser.name || currentUser.email).slice(0, 2).toUpperCase()}
@@ -147,7 +188,8 @@ export const Navbar: React.FC<NavbarProps> = ({
                   <LogOut className="w-4 h-4" />
                 </button>
               </div>
-            ) : (
+            </>
+          ) : (
               <button
                 type="button"
                 onClick={onOpenAuth}

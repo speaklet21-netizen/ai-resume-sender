@@ -83,6 +83,8 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'match' | 'tracker' | 'similar-jobs'>('match');
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [uploaderKey, setUploaderKey] = useState(0);
+  const [isConnectingGmail, setIsConnectingGmail] = useState(false);
+  const [csrfToken, setCsrfToken] = useState<string>('');
 
   // Active User Account session (defaults to sumitrawat.corp@gmail.com or saved user)
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
@@ -251,6 +253,127 @@ export default function App() {
     setUploaderKey((prev) => prev + 1);
   };
 
+  // Check active server-side session and Gmail OAuth status on load
+  useEffect(() => {
+    fetch('/api/auth/session')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.authenticated && data.email) {
+          if (data.csrfToken) setCsrfToken(data.csrfToken);
+          setCurrentUser((prev) => {
+            const updated: UserAccount = {
+              email: data.email,
+              name: prev?.name || 'User',
+              authMethod: 'otp' as const,
+              avatarBg: prev?.avatarBg || 'bg-emerald-600',
+              createdAt: prev?.createdAt || new Date().toISOString(),
+              gmailStatus: data.gmailStatus || { connected: false },
+            };
+            try {
+              localStorage.setItem(STORAGE_KEY_AUTH_USER, JSON.stringify(updated));
+            } catch {}
+            return updated;
+          });
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Handle Google OAuth callback URL parameters (/?gmail_connected=true or /?gmail_error=...)
+  useEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const gmailConnected = urlParams.get('gmail_connected');
+    const gmailError = urlParams.get('gmail_error');
+
+    if (gmailConnected === 'true') {
+      fetch('/api/auth/google/status')
+        .then((res) => res.json())
+        .then((statusData) => {
+          if (statusData && statusData.connected) {
+            setCurrentUser((prev) => {
+              if (!prev) return prev;
+              const updated: UserAccount = {
+                ...prev,
+                gmailStatus: {
+                  connected: true,
+                  email: statusData.email,
+                  connectedAt: statusData.connectedAt,
+                  scopeValid: statusData.scopeValid,
+                },
+              };
+              try {
+                localStorage.setItem(STORAGE_KEY_AUTH_USER, JSON.stringify(updated));
+              } catch {}
+              return updated;
+            });
+          }
+        })
+        .catch(() => {});
+
+      window.history.replaceState({}, document.title, window.location.pathname);
+    } else if (gmailError) {
+      alert(`Gmail Connection Error: ${decodeURIComponent(gmailError)}`);
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+  }, []);
+
+  const handleConnectGmail = async () => {
+    try {
+      setIsConnectingGmail(true);
+      const res = await fetch('/api/auth/google/url');
+      if (res.status === 401) {
+        setIsConnectingGmail(false);
+        setIsAuthModalOpen(true);
+        alert('Please sign in with your email OTP first to securely connect your Gmail account.');
+        return;
+      }
+      const data = await res.json();
+      if (data.url) {
+        window.location.href = data.url;
+      } else {
+        alert(data.error || 'Failed to start Gmail connection');
+        setIsConnectingGmail(false);
+      }
+    } catch (err: any) {
+      alert(err.message || 'Failed to connect Gmail');
+      setIsConnectingGmail(false);
+    }
+  };
+
+  const handleDisconnectGmail = async () => {
+    if (!window.confirm('Are you sure you want to disconnect your Gmail account? You will switch back to SMTP sending.')) {
+      return;
+    }
+    try {
+      const res = await fetch('/api/auth/google/disconnect', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+          ...(csrfToken ? { 'X-CSRF-Token': csrfToken } : {}),
+        },
+      });
+      const data = await res.json();
+      if (data.success) {
+        setCurrentUser((prev) => {
+          if (!prev) return prev;
+          const updated: UserAccount = {
+            ...prev,
+            gmailStatus: { connected: false },
+          };
+          try {
+            localStorage.setItem(STORAGE_KEY_AUTH_USER, JSON.stringify(updated));
+          } catch {}
+          return updated;
+        });
+      } else {
+        alert(data.error || 'Failed to disconnect Gmail');
+      }
+    } catch (err: any) {
+      alert(err.message || 'Error disconnecting Gmail');
+    }
+  };
+
   const handleLoginSuccess = (user: UserAccount) => {
     isInitialLoadDoneRef.current = false;
     setCurrentUser(user);
@@ -286,10 +409,40 @@ export default function App() {
           }
         })
         .catch(() => {});
+
+      // Sync backend session and Gmail status
+      fetch('/api/auth/session')
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.authenticated) {
+            if (data.csrfToken) setCsrfToken(data.csrfToken);
+            if (data.gmailStatus) {
+              setCurrentUser((prev) => {
+                if (!prev) return prev;
+                const updated: UserAccount = { ...prev, gmailStatus: data.gmailStatus };
+                try {
+                  localStorage.setItem(STORAGE_KEY_AUTH_USER, JSON.stringify(updated));
+                } catch {}
+                return updated;
+              });
+            }
+          }
+        })
+        .catch(() => {});
     } catch {}
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: {
+          'X-Requested-With': 'XMLHttpRequest',
+          ...(csrfToken ? { 'X-CSRF-Token': csrfToken } : {}),
+        },
+      });
+    } catch {}
+
     try {
       localStorage.removeItem(STORAGE_KEY_AUTH_USER);
     } catch {}
@@ -685,6 +838,9 @@ export default function App() {
           currentUser={currentUser}
           onOpenAuth={() => setIsAuthModalOpen(true)}
           onLogout={handleLogout}
+          onConnectGmail={handleConnectGmail}
+          onDisconnectGmail={handleDisconnectGmail}
+          isConnectingGmail={isConnectingGmail}
         />
 
         {/* Main Light Canvas Content Area (Original Feature Order) */}

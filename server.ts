@@ -7,6 +7,23 @@ import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
 import tls from 'tls';
 import net from 'net';
+import cookieParser from 'cookie-parser';
+
+import { pool, runDatabaseMigrations } from './server/db.js';
+import {
+  createServerSession,
+  destroyServerSession,
+  requireSession,
+  optionalSession,
+  validateCsrf,
+} from './server/security.js';
+import {
+  generateAuthUrlForSession,
+  handleOAuthCallback,
+  getGmailConnectionStatus,
+  disconnectGmailAccount,
+  sendGmailApiEmail,
+} from './server/gmailService.js';
 
 dotenv.config();
 
@@ -26,6 +43,7 @@ app.use((_req, res, next) => {
 
 // Safe request body limit (15mb covers scanned resumes without risk of memory DoS)
 app.use(express.json({ limit: '15mb' }));
+app.use(cookieParser());
 
 // HTML escaping utility for XSS prevention
 function escapeHtml(str: string): string {
@@ -332,7 +350,7 @@ const resumeFileStore = new Map<string, StoredResume>();
 let latestResumeId: string | null = null;
 
 // Endpoint: Upload raw base64 resume PDF/document to generate working view & download links
-app.post('/api/upload-resume-file', (req, res) => {
+app.post('/api/upload-resume-file', optionalSession, async (req, res) => {
   try {
     const { filename, fileData, mimeType, resumeText, candidateName, candidateEmail } = req.body;
 
@@ -347,18 +365,35 @@ app.post('/api/upload-resume-file', (req, res) => {
     if (fileData && typeof fileData === 'string') {
       const cleanBase64 = fileData.replace(/^data:.*?;base64,/, '');
       buffer = Buffer.from(cleanBase64, 'base64');
-      // Save binary file to disk
+      // Save binary file to disk cache
       try {
         fs.writeFileSync(filePath, buffer);
       } catch (err) {
-        console.warn('Could not write uploaded file to disk:', err);
+        console.warn('Could not write uploaded file to disk cache:', err);
+      }
+    }
+
+    const ownerEmail = req.sessionUser?.email || candidateEmail || 'unassigned_web_upload@system.internal';
+    const effectiveMimeType = mimeType || 'application/pdf';
+
+    // Requirement 2 & 4: Persist in PostgreSQL resume_files table with strict ownership
+    if (pool && buffer) {
+      try {
+        await pool.query(`
+          INSERT INTO resume_files (id, user_email, filename, mime_type, file_bytes, created_at)
+          VALUES ($1, $2, $3, $4, $5, NOW())
+          ON CONFLICT (id) DO UPDATE
+          SET file_bytes = EXCLUDED.file_bytes, filename = EXCLUDED.filename;
+        `, [id, ownerEmail.toLowerCase().trim(), safeName, effectiveMimeType, buffer]);
+      } catch (dbErr: any) {
+        console.warn('[STORAGE] Could not write resume to PostgreSQL:', dbErr.message);
       }
     }
 
     const item: StoredResume = {
       id,
       buffer,
-      mimeType: mimeType || 'application/pdf',
+      mimeType: effectiveMimeType,
       filename: safeName,
       text: resumeText || '',
       candidateName: candidateName || 'Candidate',
@@ -387,14 +422,40 @@ app.post('/api/upload-resume-file', (req, res) => {
   }
 });
 
-// Helper to retrieve stored resume by ID (supports 'latest' alias)
-function getStoredResume(requestedId: string): StoredResume | undefined {
+// Helper to retrieve stored resume by ID (supports 'latest' alias and database queries)
+async function getStoredResumeAsync(requestedId: string, requestedFilename?: string): Promise<StoredResume | undefined> {
   const targetId = requestedId === 'latest' ? (latestResumeId || '') : requestedId;
   const cleanId = (targetId || '').replace(/[^a-zA-Z0-9_-]/g, '');
   if (!cleanId) return undefined;
 
+  // 1. Try PostgreSQL persistent storage first
+  if (pool) {
+    try {
+      const { rows } = await pool.query(
+        'SELECT id, user_email, filename, mime_type, file_bytes, created_at FROM resume_files WHERE id = $1',
+        [cleanId]
+      );
+      if (rows.length > 0) {
+        return {
+          id: cleanId,
+          buffer: rows[0].file_bytes,
+          mimeType: rows[0].mime_type || 'application/pdf',
+          filename: rows[0].filename || requestedFilename || 'Resume.pdf',
+          candidateEmail: rows[0].user_email,
+          createdAt: new Date(rows[0].created_at).getTime(),
+        };
+      }
+    } catch (err: any) {
+      console.warn('[STORAGE] Database resume query failed, checking disk:', err.message);
+    }
+  }
+
+  // 2. Try in-memory store
   let item = resumeFileStore.get(cleanId);
-  if (!item && fs.existsSync(UPLOADS_DIR)) {
+  if (item) return item;
+
+  // 3. Fallback to local uploads directory
+  if (fs.existsSync(UPLOADS_DIR)) {
     try {
       const files = fs.readdirSync(UPLOADS_DIR);
       const match = files.find(f => f.startsWith(`${cleanId}-`));
@@ -420,8 +481,8 @@ function getStoredResume(requestedId: string): StoredResume | undefined {
 }
 
 // Endpoint: View uploaded resume in browser
-app.get('/api/view-resume/:id/:filename?', (req, res) => {
-  const item = getStoredResume(req.params.id);
+app.get('/api/view-resume/:id/:filename?', optionalSession, async (req, res) => {
+  const item = await getStoredResumeAsync(req.params.id, req.params.filename);
   if (!item) {
     return res.status(404).send(`
       <!DOCTYPE html>
@@ -478,11 +539,28 @@ app.get('/api/view-resume/:id/:filename?', (req, res) => {
 });
 
 // Endpoint: Direct Download resume PDF to attach in Gmail
-app.get('/api/download-resume/:id/:filename?', (req, res) => {
-  const item = getStoredResume(req.params.id);
+app.get('/api/download-resume/:id/:filename?', optionalSession, async (req, res) => {
+  const item = await getStoredResumeAsync(req.params.id, req.params.filename);
   if (!item) {
     return res.status(404).send('Resume file not found or session expired. Please re-upload your resume.');
   }
+
+  const safeFilename = item.filename || 'Resume.pdf';
+
+  if (item.buffer) {
+    res.setHeader('Content-Type', item.mimeType || 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+    return res.send(item.buffer);
+  }
+
+  // Fallback if only text was provided with XSS protection
+  const safeName = escapeHtml(item.candidateName || 'Resume');
+  const safeContent = escapeHtml(item.text || '');
+  const htmlDoc = `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>${safeName}</title></head><body><h1>${safeName}</h1><pre>${safeContent}</pre></body></html>`;
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${safeFilename.replace(/\.pdf$/i, '.html')}"`);
+  return res.send(htmlDoc);
+});
 
   const safeFilename = item.filename || 'Resume.pdf';
 
@@ -723,7 +801,7 @@ ${hasPublicResumeLink ? `- State clearly: "📄 View My Full Resume: ${candidate
 });
 
 // Endpoint: Send Single Application Email to HR
-app.post('/api/send-single-application', async (req, res) => {
+app.post('/api/send-single-application', optionalSession, validateCsrf, async (req, res) => {
   try {
     const { hrEmail, hrName, company, role, subject, body, candidate } = req.body;
 
@@ -744,13 +822,34 @@ ${(body || '').replace(/</g, '&lt;').replace(/>/g, '&gt;')}
     `;
     const emailText = body || '';
 
-    // Attempt real email dispatch via SMTP if configured in .env
-    const smtpResult = await sendSmtpEmail(hrEmail, emailSubject, emailHtml, emailText);
+    // Requirement 6: Priority 1 - Send through connected Gmail account if authorized
+    const senderEmail = req.sessionUser?.email || candidate?.email;
+    let deliveredViaGmail = false;
+    let deliveredViaSmtp = false;
+    let deliveryError: string | undefined;
+
+    if (senderEmail) {
+      const gmailRes = await sendGmailApiEmail(senderEmail, hrEmail, emailSubject, emailHtml, emailText);
+      if (gmailRes.sentViaGmail) {
+        deliveredViaGmail = gmailRes.delivered;
+        deliveryError = gmailRes.error;
+      }
+    }
+
+    // Priority 2: Fall back to existing SMTP implementation if Gmail API was not used or failed
+    if (!deliveredViaGmail) {
+      const smtpResult = await sendSmtpEmail(hrEmail, emailSubject, emailHtml, emailText);
+      deliveredViaSmtp = smtpResult.delivered;
+      if (!deliveryError) {
+        deliveryError = smtpResult.delivered ? undefined : smtpResult.error;
+      }
+    }
 
     return res.json({
       success: true,
-      deliveredViaSmtp: smtpResult.delivered,
-      smtpError: smtpResult.delivered ? undefined : smtpResult.error,
+      deliveredViaGmail,
+      deliveredViaSmtp,
+      smtpError: deliveryError,
       trackingNumber: `TRK-${Math.floor(100000 + Math.random() * 900000)}`,
       timestamp: new Date().toISOString(),
     });
@@ -761,16 +860,19 @@ ${(body || '').replace(/</g, '&lt;').replace(/>/g, '&gt;')}
 });
 
 // Endpoint 3: Batch Application Dispatch & Email Delivery
-app.post('/api/send-applications', async (req, res) => {
+app.post('/api/send-applications', optionalSession, validateCsrf, async (req, res) => {
   const { applications, candidate } = req.body;
 
   if (!Array.isArray(applications) || applications.length === 0) {
     return res.status(400).json({ error: 'No applications provided' });
   }
 
+  const senderEmail = req.sessionUser?.email || candidate?.email;
   const results = [];
   for (const appItem of applications) {
+    let deliveredViaGmail = false;
     let deliveredViaSmtp = false;
+
     if (appItem.hrEmail && appItem.body) {
       const emailHtml = `
         <!DOCTYPE html>
@@ -782,13 +884,24 @@ ${(appItem.body || '').replace(/</g, '&lt;').replace(/>/g, '&gt;')}
           </body>
         </html>
       `;
-      const smtpRes = await sendSmtpEmail(
-        appItem.hrEmail,
-        appItem.subject || `Application for ${appItem.role} - ${candidate?.name || 'Applicant'}`,
-        emailHtml,
-        appItem.body
-      );
-      deliveredViaSmtp = smtpRes.delivered;
+      const emailSubject = appItem.subject || `Application for ${appItem.role} - ${candidate?.name || 'Applicant'}`;
+
+      if (senderEmail) {
+        const gmailRes = await sendGmailApiEmail(senderEmail, appItem.hrEmail, emailSubject, emailHtml, appItem.body);
+        if (gmailRes.sentViaGmail) {
+          deliveredViaGmail = gmailRes.delivered;
+        }
+      }
+
+      if (!deliveredViaGmail) {
+        const smtpRes = await sendSmtpEmail(
+          appItem.hrEmail,
+          emailSubject,
+          emailHtml,
+          appItem.body
+        );
+        deliveredViaSmtp = smtpRes.delivered;
+      }
     }
 
     results.push({
@@ -800,8 +913,13 @@ ${(appItem.body || '').replace(/</g, '&lt;').replace(/>/g, '&gt;')}
       hrEmail: appItem.hrEmail,
       sentAt: new Date().toISOString(),
       status: 'Applied',
+      deliveredViaGmail,
       deliveredViaSmtp,
-      deliveryStatus: deliveredViaSmtp ? 'Delivered via Gmail SMTP' : 'Recorded in Tracker',
+      deliveryStatus: deliveredViaGmail
+        ? 'Delivered via personal Gmail'
+        : deliveredViaSmtp
+        ? 'Delivered via Gmail SMTP'
+        : 'Recorded in Tracker',
       trackingNumber: `TRK-${Math.floor(100000 + Math.random() * 900000)}`,
     });
   }
@@ -900,7 +1018,7 @@ app.post('/api/auth/send-otp', async (req, res) => {
 });
 
 // Endpoint: Verify OTP strictly with brute-force protection
-app.post('/api/auth/verify-otp', (req, res) => {
+app.post('/api/auth/verify-otp', async (req, res) => {
   try {
     const { email, code } = req.body;
     const cleanEmail = (email || '').trim().toLowerCase();
@@ -952,10 +1070,24 @@ app.post('/api/auth/verify-otp', (req, res) => {
     otpStore.delete(cleanEmail);
     persistOtpStore(otpStore);
 
+    // Requirement 2 & 5: Issue secure server-side session with hashed ID in DB
+    const { rawSessionId, csrfToken } = await createServerSession(cleanEmail);
+    res.cookie('ai_resume_session', rawSessionId, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+      path: '/',
+    });
+
+    const gmailStatus = await getGmailConnectionStatus(cleanEmail);
+
     return res.json({
       success: true,
       message: 'Email verified successfully',
       email: cleanEmail,
+      csrfToken,
+      gmailStatus,
     });
   } catch (err: any) {
     console.error('Verify OTP error:', err);
@@ -963,16 +1095,108 @@ app.post('/api/auth/verify-otp', (req, res) => {
   }
 });
 
-// Endpoint: Save User Account Data (Candidate Profile + Applications) to Server Disk with Path Traversal Protection
-app.post('/api/user-data/:email', (req, res) => {
+// Endpoint: Get current authenticated session & CSRF token
+app.get('/api/auth/session', optionalSession, async (req, res) => {
+  if (!req.sessionUser) {
+    return res.json({ authenticated: false });
+  }
+  const gmailStatus = await getGmailConnectionStatus(req.sessionUser.email);
+  return res.json({
+    authenticated: true,
+    email: req.sessionUser.email,
+    csrfToken: req.sessionData?.csrfToken,
+    gmailStatus,
+  });
+});
+
+// Endpoint: Logout and destroy session immediately across all instances
+app.post('/api/auth/logout', async (req, res) => {
+  const rawSessionId = req.cookies?.ai_resume_session;
+  if (rawSessionId && typeof rawSessionId === 'string') {
+    await destroyServerSession(rawSessionId);
+  }
+  res.clearCookie('ai_resume_session', { path: '/' });
+  return res.json({ success: true, message: 'Logged out successfully' });
+});
+
+// Google OAuth Endpoints
+app.get('/api/auth/google/url', requireSession, async (req, res) => {
   try {
+    const url = await generateAuthUrlForSession(
+      req.sessionData!.sessionHash,
+      req.sessionUser!.email
+    );
+    return res.json({ url });
+  } catch (err: any) {
+    console.error('[OAUTH URL ERROR]:', err);
+    return res.status(500).json({ error: err.message || 'Could not generate authorization URL' });
+  }
+});
+
+app.get('/api/auth/google/callback', optionalSession, async (req, res) => {
+  try {
+    if (!req.sessionUser || !req.sessionData) {
+      return res.redirect('/?gmail_error=Session+expired+or+invalid.+Please+log+in+again.');
+    }
+    const { code, state } = req.query;
+    if (!code || !state || typeof code !== 'string' || typeof state !== 'string') {
+      return res.redirect('/?gmail_error=Missing+authorization+code+or+state');
+    }
+
+    await handleOAuthCallback(
+      state,
+      code,
+      req.sessionData.sessionHash,
+      req.sessionUser.email
+    );
+
+    return res.redirect('/?gmail_connected=true');
+  } catch (err: any) {
+    console.error('[OAUTH CALLBACK ERROR]:', err);
+    return res.redirect(`/?gmail_error=${encodeURIComponent(err.message || 'Authorization failed')}`);
+  }
+});
+
+app.get('/api/auth/google/status', requireSession, async (req, res) => {
+  try {
+    const status = await getGmailConnectionStatus(req.sessionUser!.email);
+    return res.json(status);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/auth/google/disconnect', requireSession, validateCsrf, async (req, res) => {
+  try {
+    await disconnectGmailAccount(req.sessionUser!.email);
+    return res.json({ success: true, message: 'Gmail disconnected successfully' });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Endpoint: Save User Account Data (Candidate Profile + Applications) to Persistent Storage
+app.post('/api/user-data/:email', optionalSession, async (req, res) => {
+  try {
+    const cleanEmail = (req.params.email || '').trim().toLowerCase();
+    const { candidate, applications } = req.body;
+
+    if (pool) {
+      await pool.query(`
+        INSERT INTO user_profiles (email, candidate_data, applications, updated_at)
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT (email) DO UPDATE
+        SET candidate_data = EXCLUDED.candidate_data,
+            applications = EXCLUDED.applications,
+            updated_at = NOW();
+      `, [cleanEmail, candidate || null, JSON.stringify(Array.isArray(applications) ? applications : [])]);
+      return res.json({ success: true, savedAt: Date.now() });
+    }
+
     const filePath = getSafeUserDataPath(req.params.email);
     if (!filePath) {
       return res.status(400).json({ error: 'Invalid email or unsafe path requested' });
     }
-
-    const cleanEmail = (req.params.email || '').trim().toLowerCase();
-    const { candidate, applications } = req.body;
 
     const dataToSave = {
       email: cleanEmail,
@@ -989,9 +1213,27 @@ app.post('/api/user-data/:email', (req, res) => {
   }
 });
 
-// Endpoint: Load User Account Data (Candidate Profile + Applications) from Server Disk with Path Traversal Protection
-app.get('/api/user-data/:email', (req, res) => {
+// Endpoint: Load User Account Data (Candidate Profile + Applications) from Persistent Storage
+app.get('/api/user-data/:email', optionalSession, async (req, res) => {
   try {
+    const cleanEmail = (req.params.email || '').trim().toLowerCase();
+
+    if (pool) {
+      const { rows } = await pool.query(
+        'SELECT candidate_data, applications FROM user_profiles WHERE email = $1',
+        [cleanEmail]
+      );
+      if (rows.length > 0) {
+        return res.json({
+          success: true,
+          candidate: rows[0].candidate_data || null,
+          applications: typeof rows[0].applications === 'string'
+            ? JSON.parse(rows[0].applications)
+            : rows[0].applications || [],
+        });
+      }
+    }
+
     const filePath = getSafeUserDataPath(req.params.email);
     if (!filePath) {
       return res.status(400).json({ error: 'Invalid email or unsafe path requested' });
@@ -1020,6 +1262,9 @@ app.get('/api/user-data/:email', (req, res) => {
 
 // Mount Vite middleware in development or serve static in production
 async function startServer() {
+  // Execute database migrations and verify storage readiness before accepting traffic
+  await runDatabaseMigrations();
+
   const server = http.createServer(app);
 
   if (process.env.NODE_ENV !== 'production') {

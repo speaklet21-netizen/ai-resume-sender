@@ -61,12 +61,18 @@ export interface MatchedInternship extends Internship {
   eligibilityReason?: string;
 }
 
+export interface GmailConnectionStatus {
+  connected: boolean;
+  connectedEmail?: string;
+}
+
 export interface UserAccount {
   email: string;
   name: string;
   authMethod: 'password' | 'otp';
   avatarBg?: string;
   createdAt: string;
+  gmailStatus?: GmailConnectionStatus;
 }
 
 export interface CandidateProfile {

@@ -157,7 +157,10 @@ export const PitchPreviewModal: React.FC<PitchPreviewModalProps> = ({
     try {
       const res = await fetch('/api/send-single-application', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
         body: JSON.stringify({
           hrEmail: internship.hr.email,
           hrName: internship.hr.name,
@@ -172,7 +175,9 @@ export const PitchPreviewModal: React.FC<PitchPreviewModalProps> = ({
       onSendSingle(record);
       setIsDispatched(true);
 
-      if (data.deliveredViaSmtp) {
+      if (data.deliveredViaGmail) {
+        setSendNotice(`✓ Sent from your personal Gmail account to ${internship.hr.name} (${internship.hr.email})!`);
+      } else if (data.deliveredViaSmtp) {
         setSendNotice(`✓ Direct email sent to ${internship.hr.name} (${internship.hr.email}) via SMTP!`);
       } else {
         setSendNotice(`✓ Application pitch directly dispatched to ${internship.hr.name} and logged in tracker!`);
