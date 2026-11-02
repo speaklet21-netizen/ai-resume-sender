@@ -1,0 +1,7 @@
+{
+  "name": "InternMatch AI - Smart Resume Analyzer & Direct HR Sender",
+  "description": "AI-powered internship matching platform. Analyze resume skills, detect skill gaps, verify company and HR LinkedIn profiles, and send tailored applications in 1-click with real-time status tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
